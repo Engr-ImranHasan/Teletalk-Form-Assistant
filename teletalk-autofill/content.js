@@ -1,0 +1,218 @@
+(()=>{
+ if(globalThis.__teletalkAssistant)return;globalThis.__teletalkAssistant=true;
+ const norm=s=>String(s??'').toLowerCase().replace(/[’']/g,'').replace(/[^\p{L}\p{N}]+/gu,' ').trim();
+ const site=()=>location.origin+location.pathname;
+ const forbidden=e=>['password','file','submit','button','reset','hidden'].includes(e.type)||/captcha|verification|verify.?code|security.?code|declaration|declare|agree|consent|যাচাইকরণ/.test(norm([e.id,e.name,e.placeholder,label(e)].join(' ')))||e.id==='ta-overlay';
+ function texts(node){if(!node)return '';const clone=node.cloneNode(true);clone.querySelectorAll?.('select,input,textarea,script,style,button').forEach(x=>x.remove());return clone.textContent?.trim()||'';}
+ function label(e){
+ const explicit=[...(e.labels||[])].map(texts).join(' ').trim();if(explicit)return explicit;
+ if(e.getAttribute('aria-label'))return e.getAttribute('aria-label');
+ const cell=e.closest('td,th');
+ if(cell){const own=texts(cell);if(own)return own;let p=cell.previousElementSibling;if(p&&/^(TD|TH)$/.test(p.tagName))return texts(p);}
+ let p=e.previousSibling;for(let i=0;p&&i<4;i++,p=p.previousSibling){const t=p.nodeType===3?p.textContent:texts(p);if(t?.trim())return t.trim();}
+ const group=e.closest('.form-group,.field');if(group)return texts(group);
+ return e.placeholder||'';
+ }
+ function controls(){
+ const out=[];let section='basic';const walker=document.createTreeWalker(document.body,NodeFilter.SHOW_TEXT|NodeFilter.SHOW_ELEMENT);let n;
+ while(n=walker.nextNode()){
+ if(n.nodeType===3){if(n.parentElement.closest('select,option,script,style,#ta-overlay,button'))continue;const text=norm(n.textContent);if(!text||text.length>100)continue;
+ for(const [key,aa] of Object.entries(SECTION_ALIASES)){if(aa.some(a=>text===norm(a)||text.startsWith(norm(a)+' ')))section=key;}
+ }else if(n.matches?.('input,select,textarea')&&!n.closest('#ta-overlay')&&!forbidden(n)){
+ let sec=section;const l=norm(label(n));
+ if(n.type==='checkbox'&&/if applicable|^applicable$/.test(l)){
+ // In Teletalk, the activation checkbox can precede the section heading.
+ let next=n.closest('tr')?.nextElementSibling||n.parentElement?.nextElementSibling;const hint=norm(texts(next));
+ if(/masters/.test(hint))sec='masters';else if(/job experience/.test(hint))sec='job';
+ }
+ if(n.type==='checkbox'&&/same as present/.test(l))sec='permanent';
+ out.push({e:n,section:sec,label:label(n),index:out.length});
+ }
+ }return out;
+ }
+ function locator(c){return {id:c.e.id||'',name:c.e.name||'',tag:c.e.tagName,type:c.e.type||'',index:c.index,label:norm(c.label)};}
+ function resolve(loc,cs){
+ const pool=cs.filter(c=>c.e.tagName===loc.tag&&c.e.type===loc.type);
+ let c;if(loc.id){const hits=pool.filter(c=>c.e.id===loc.id);if(hits.length===1)c=hits[0];}
+ if(!c&&loc.name){const hits=pool.filter(c=>c.e.name===loc.name);if(hits.length===1)c=hits[0];}
+ if(!c)c=cs[loc.index];
+ if(!c||c.e.tagName!==loc.tag||c.e.type!==loc.type||loc.label&&norm(c.label)!==loc.label)return null;
+ return c;
+ }
+ function match(f,cs,maps){
+ const saved=maps[site()]?.[f.id];
+ if(saved){
+  const mapped=resolve(saved,cs);
+  if(!isBCIC()||!/^job\d*$/.test(f.section)||f.key==='enabled')return {c:mapped,mapped:true};
+  const ordinal=f.section==='job'?0:Number(f.section.slice(3))-1,expected=jobRows()[ordinal];
+  if(mapped&&expected?.contains(mapped.e))return {c:mapped,mapped:true};
+  // A deleted/reordered job row can invalidate an old mapping; use verified row-local fields instead.
+ }
+
+ if(f.key==='post')return {c:null};
+ if(location.hostname==='bcic.teletalk.com.bd'&&location.pathname==='/bcic202606/application.php'){
+  const key=f.id.replace(/^job\d+\./,'job.');const known=BCIC_IDS[key];
+  if(known){
+   const jobMatch=f.section.match(/^job(\d+)?$/);let candidates;
+   if(jobMatch&&f.key!=='enabled'){
+    const ordinal=jobMatch[1]?Number(jobMatch[1])-1:0,row=jobRows()[ordinal];
+    candidates=row?cs.filter(c=>row.contains(c.e)&&c.e.name?.endsWith(`[${known}]`)):[];
+   }else candidates=cs.filter(c=>c.e.id===known);
+   if(candidates.length===1)return {c:candidates[0]};
+  }
+ }
+ if(/^job\d/.test(f.section))return {c:null};
+ const hits=[];
+ for(const c of cs){
+ if(c.section!==f.section)continue;
+ if((f.type==='check')!==(c.e.type==='checkbox'))continue;
+ const lbl=norm(c.label),ids=[norm(c.e.id),norm(c.e.name)],ph=norm(c.e.placeholder);let score=0;
+ for(const a of f.aliases){const aa=norm(a);if(lbl===aa)score=Math.max(score,100+aa.length/100);if(ids.includes(aa))score=Math.max(score,90+aa.length/100);if(ph===aa)score=Math.max(score,85+aa.length/100);}
+ // Never infer a Bangla name from an English label or a number from a status dropdown.
+ if(f.key.endsWith('Bn')&&!/বাংলা|bangla|bangali|bengali| bn$/.test(norm([c.label,c.e.id,c.e.name,c.e.placeholder].join(' '))))score=0;
+ if(['nid','birth','passport','result'].includes(f.key)&&c.e.tagName==='SELECT')score=0;
+ if(f.type==='choice'&&c.e.tagName!=='SELECT')score=0;
+ if(score)hits.push({c,score});
+ }
+ hits.sort((a,b)=>b.score-a.score);if(!hits.length||hits[1]?.score===hits[0].score)return {c:null};return {c:hits[0].c};
+ }
+ function choiceOptions(e){return e.tagName==='SELECT'?[...e.options].filter(o=>!o.disabled&&o.value!==''&&!/^(select|please select|নির্বাচন)/i.test(o.textContent.trim())).map(o=>({text:o.textContent.trim(),value:o.value})):[];}
+ function scan(p,maps){const cs=controls(),catalog={},catalogContext={},missing=[];let matched=0;const used=new Set();
+ if(!cs.length)return {error:'এই পেজে আবেদন ফরমের ঘর নেই। মূল সাইট থেকে সার্কুলার ও পদ নির্বাচন করে তথ্য দেওয়ার আসল ফরম খুলুন।'};
+ for(const f of profileFields(p)){const {c}=match(f,cs,maps);if(c&&!used.has(c.e)){used.add(c.e);matched++;if(c.e.tagName==='SELECT'){
+  catalog[f.id]=choiceOptions(c.e);const parentId=DEPENDENT_PARENTS[f.id];
+  if(parentId){const parent=match(FIELDS.find(f=>f.id===parentId),cs,maps).c;catalogContext[f.id]=parent?.e.selectedOptions?.[0]?.textContent?.trim()||'';}
+ }}else if(f.key!=='post')missing.push(f.label);}
+ return {catalog,catalogContext,total:cs.length,matched,missing};
+ }
+
+ function visible(e){return e.getClientRects().length>0&&!e.disabled&&!e.readOnly;}
+ function change(e,v){
+ if(e.type==='checkbox'){
+ if(e.checked!==!!v)e.click();return e.checked===!!v;
+ }
+ if(e.tagName==='SELECT'){
+ if(e.id==='marital_status'&&v==='Unmarried')v='Single';
+ let hits=[...e.options].filter(o=>!o.disabled&&norm(o.textContent)===norm(v));
+ if(!hits.length)hits=[...e.options].filter(o=>!o.disabled&&o.value===String(v));
+ if(hits.length!==1)return false;const setter=Object.getOwnPropertyDescriptor(HTMLSelectElement.prototype,'value').set;setter.call(e,hits[0].value);
+ }else{
+ let value=String(v);
+ if(/^\d{4}-\d{2}-\d{2}$/.test(value)&&e.type!=='date'){
+ if(/yyyy.*mm.*dd/i.test(e.placeholder||''))value=value;
+ else{const [y,m,d]=value.split('-');value=/\//.test(e.placeholder||'')?`${d}/${m}/${y}`:`${d}-${m}-${y}`;}
+ }
+ const proto=e.tagName==='TEXTAREA'?HTMLTextAreaElement.prototype:HTMLInputElement.prototype;
+ Object.getOwnPropertyDescriptor(proto,'value').set.call(e,value);
+ if(e.value!==value)return false;
+ }
+ e.dispatchEvent(new Event('input',{bubbles:true}));e.dispatchEvent(new Event('change',{bubbles:true}));e.dispatchEvent(new Event('blur',{bubbles:true}));return true;
+ }
+ const pause=ms=>new Promise(r=>setTimeout(r,ms));
+ function isBCIC(){return location.hostname==='bcic.teletalk.com.bd'&&location.pathname==='/bcic202606/application.php';}
+ function jobRows(){return [...document.querySelectorAll('#expSection .jobExpTemplate')].filter(row=>row.querySelector('select[name*="[employment_type]"]'));}
+ function waitUntil(test,timeout=5000){
+  return new Promise((resolve,reject)=>{
+   if(test()){resolve();return;}
+   const observer=new MutationObserver(()=>{if(test()){cleanup();resolve();}});
+   const timer=setTimeout(()=>{cleanup();reject(Error('নতুন অভিজ্ঞতার সারি আসেনি।'));},timeout);
+   function cleanup(){observer.disconnect();clearTimeout(timer);}
+   observer.observe(document.body,{subtree:true,childList:true,attributes:true});
+  });
+ }
+ async function addJobRow(number){
+  if(jobRows().length>=number)return false;
+  const button=document.getElementById('addNewJob');
+  if(!isBCIC()||!button||button.tagName!=='BUTTON'||button.type!=='button'||!button.closest('#expSection')||!/\baddNewExp\s*\(/.test(button.getAttribute('onclick')||''))throw Error('এই ফরমের নিরাপদ ADD MORE বোতাম শনাক্ত করা যায়নি।');
+  if(!visible(button))throw Error('ADD MORE বোতাম নিষ্ক্রিয় বা লুকানো। If Applicable চালু আছে কি না দেখুন।');
+  const pending=waitUntil(()=>jobRows().length>=number);button.click();await pending;await pause(120);return true;
+ }
+ async function fill(p,maps){
+ if(!p||!p.values)return {error:'প্রোফাইলে তথ্য নেই।'};
+ const fs=profileFields(p),done=new Set(),why=new Map(),claimed=new Map(),attempted=new Set();
+ const jobInfo={requested:p.values['job.enabled']?Math.max(1,Math.min(20,Math.trunc(Number(p.jobsCount))||1)):0,created:0,filled:0,reused:0,stopped:''};
+ function eligible(f,cs){
+  const v=p.values[f.id];if(f.key==='post'||v===undefined||v===''||v===null)return false;
+  if(f.section==='masters'&&f.key!=='enabled'&&!p.values['masters.enabled'])return false;
+  if(f.section.startsWith('job')&&f.key!=='enabled'&&!p.values['job.enabled'])return false;
+  if(f.section==='permanent'&&f.key!=='same'&&p.values['permanent.same'])return false;
+  if(f.key==='to'&&p.values[f.section+'.current'])return false;
+  if(f.id==='basic.spouse'){const marital=match(FIELDS.find(x=>x.id==='basic.marital'),cs||controls(),maps).c;if(!isMarried(p.values['basic.marital'],marital?choiceOptions(marital.e):[]))return false;}
+  return true;
+ }
+ async function apply(f,cs){
+  if(done.has(f.id)||!eligible(f,cs))return;
+  const {c,mapped}=match(f,cs,maps),v=p.values[f.id];
+  // BCIC's additional row template has no Currently Working checkbox.
+  // An unchecked optional checkbox needs no invented field or error.
+  if(f.key==='current'&&v===false&&!c)return;
+  attempted.add(f.id);
+  if(!c){why.set(f.id,f.key==='current'&&v===true?'সাইটের এই সারিতে Currently Working ঘর নেই; শেষ তারিখ দিয়ে প্রোফাইলের টিক সরান':mapped?'সংরক্ষিত সংযোগ আর মেলেনি':'ঘর শনাক্ত হয়নি');return;}
+  if(claimed.has(c.e)&&claimed.get(c.e)!==f.id){why.set(f.id,'একই ঘর একাধিক তথ্যের সঙ্গে মিলেছে');return;}
+  if(!visible(c.e)){why.set(f.id,'ঘর নিষ্ক্রিয় / লুকানো / পরিবর্তনযোগ্য নয়');return;}
+  try{
+   if(change(c.e,v)){done.add(f.id);claimed.set(c.e,f.id);why.delete(f.id);const oldOutline=c.e.style.outline;c.e.style.outline='2px solid #278258';setTimeout(()=>{c.e.style.outline=oldOutline;},2500);await pause(c.e.tagName==='SELECT'||c.e.type==='checkbox'?220:12);}
+   else why.set(f.id,'অপশন / তারিখ / মান মেলেনি');
+  }catch(e){why.set(f.id,'সাইটের নিয়মে বসানো যায়নি');}
+ }
+ const ordinary=fs.filter(f=>!/^job\d*$/.test(f.section)||f.id==='job.enabled');
+ for(let pass=0;pass<6;pass++){
+  const cs=controls();for(const f of ordinary)await apply(f,cs);
+  if(ordinary.every(f=>!eligible(f,cs)||done.has(f.id)))break;
+  await pause(450);
+ }
+ if(jobInfo.requested){
+  for(let number=1;number<=jobInfo.requested;number++){
+   const section=number===1?'job':'job'+number,rowFields=fs.filter(f=>f.section===section&&f.key!=='enabled');
+   try{
+    if(isBCIC()){
+     if(number===1&&!jobRows().length)throw Error('প্রথম চাকরির অভিজ্ঞতার সারি পাওয়া যায়নি।');
+     if(jobRows().length<number){if(await addJobRow(number))jobInfo.created++;}
+     else jobInfo.reused++;
+    }
+   }catch(e){
+    jobInfo.stopped='অভিজ্ঞতা '+number+': '+e.message;
+    for(const f of fs.filter(f=>/^job\d*$/.test(f.section)&&f.key!=='enabled'&&(f.section==='job'?1:Number(f.section.slice(3)))>=number&&eligible(f))){attempted.add(f.id);why.set(f.id,'সারি তৈরি করা যায়নি');}
+    break;
+   }
+   for(let pass=0;pass<3;pass++){
+    const cs=controls();for(const f of rowFields)await apply(f,cs);
+    const pending=rowFields.filter(f=>attempted.has(f.id)&&!done.has(f.id));
+    if(!pending.length)break;await pause(300);
+   }
+   const missing=rowFields.filter(f=>attempted.has(f.id)&&!done.has(f.id));
+   if(!missing.length)jobInfo.filled++;
+   if(missing.length&&number<jobInfo.requested){
+    jobInfo.stopped='অভিজ্ঞতা '+number+'-এর কিছু ঘর পূরণ হয়নি। আগে তা ঠিক করুন; পরের সারি যোগ করা বন্ধ রাখা হয়েছে।';
+    for(const f of fs.filter(f=>/^job\d+$/.test(f.section)&&Number(f.section.slice(3))>number&&eligible(f))){attempted.add(f.id);why.set(f.id,'আগের সারি অসম্পূর্ণ থাকায় পূরণ বন্ধ');}
+    break;
+   }
+  }
+ }
+ const missing=[...attempted].filter(k=>!done.has(k));
+ const fieldLabel=id=>{const f=fs.find(f=>f.id===id);const n=f?.section==='job'?1:/^job\d+$/.test(f?.section)?Number(f.section.slice(3)):null;return(n?'অভিজ্ঞতা '+n+' — ':'')+(f?.label||id);};
+ const detail=missing.map(k=>fieldLabel(k)+': '+why.get(k)).join('\n');
+ const jobSummary=jobInfo.requested?`অভিজ্ঞতা: ${jobInfo.filled}/${jobInfo.requested}টি সারি পূরণ; ${jobInfo.created}টি নতুন সারি যোগ করা হয়েছে।\n`:'';
+ const summary=`${done.size}টি ঘরে তথ্য বসানো হয়েছে। ${missing.length}টি ঘর পূরণ করা যায়নি।\n`+jobSummary+(jobInfo.stopped?jobInfo.stopped+'\n':'')+(detail?detail+'\n':'')+'ক্যাপচা, ঘোষণা ও সাবমিট স্পর্শ করা হয়নি। সব তথ্য যাচাই করুন।'+(missing.length?'\nনা-মেলা ঘর ও ADD MORE বোতাম যাচাই করে আবার চেষ্টা করুন।':'');
+ const report={at:new Date().toISOString(),profile:p.name,site:site(),filled:[...done],missing:missing.map(id=>({id,reason:why.get(id)})),jobs:jobInfo};
+ await chrome.storage.local.set({lastReport:report});return {summary,report};
+ }
+
+ let cancelPick, busy=false;
+ function pick(f,respond){
+ cancelPick?.();const box=document.createElement('div');box.id='ta-overlay';box.textContent='টেলিটক সহকারী: “'+f.label+'” ঘরে ক্লিক করুন। বাতিল: Escape';
+ Object.assign(box.style,{position:'fixed',top:'10px',left:'10px',right:'10px',padding:'18px',background:'#123f34',color:'white',font:'16px system-ui',zIndex:'2147483647',boxShadow:'0 3px 20px #0005',borderRadius:'8px'});document.body.append(box);
+ const cleanup=()=>{box.remove();document.removeEventListener('click',click,true);document.removeEventListener('keydown',key,true);clearTimeout(timer);cancelPick=null;};
+ const abort=()=>{cleanup();respond({error:'ঘর চিহ্নিত করা বাতিল হয়েছে।'});};cancelPick=abort;
+ const key=e=>{if(e.key==='Escape')abort();};
+ const click=e=>{const el=e.target.closest('input,select,textarea');if(!el||forbidden(el))return;e.preventDefault();e.stopImmediatePropagation();const c=controls().find(x=>x.e===el);if(!c)return;const result={site:site(),locator:locator(c),options:choiceOptions(el)};cleanup();respond(result);};
+ document.addEventListener('click',click,true);document.addEventListener('keydown',key,true);const timer=setTimeout(abort,120000);
+ }
+ chrome.runtime.onMessage.addListener((m,sender,respond)=>{
+ if(sender.id!==chrome.runtime.id)return;
+ if(m.action==='ping'){respond({ok:true});return;}
+ if(m.action==='scan'){try{respond(scan(m.profile,m.mappings||{}));}catch(e){respond({error:e.message});}return;}
+ if(m.action==='pick'){pick(m.field,respond);return true;}
+ if(m.action==='fill'){if(busy){respond({error:'ফরম পূরণের একটি কাজ চলছে। শেষ হলে আবার চেষ্টা করুন।'});return;}busy=true;fill(m.profile,m.mappings||{}).then(r=>{busy=false;respond(r);}).catch(e=>{busy=false;respond({error:e.message});});return true;}
+ });
+})();
